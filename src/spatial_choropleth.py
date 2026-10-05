@@ -1,128 +1,182 @@
+import argparse
 import json
 import os
+import sys
+import traceback
+from pathlib import Path
+
 import duckdb
 import geopandas as gpd
 import pandas as pd
 import plotly.express as px
 import requests
 
+SOCRATA_URL = "https://data.cityofnewyork.us/resource/erm2-nwe9.json"
+GEOJSON_URL = (
+    "https://raw.githubusercontent.com/fedeforrest/"
+    "nyc-zip-code-tabulation-areas-polygons/master/zip_code_040114.geojson"
+)
+
+# Fixed date window so the sample is reproducible and not biased toward arbitrary rows.
+START_DATE = "2024-01-01T00:00:00"
+END_DATE = "2024-02-01T00:00:00"
+PAGE_SIZE = 50_000
+MAX_ROWS = 200_000
+
+RAW_PATH = Path("data/raw/311_raw_sample.csv")
+SUMMARY_PATH = Path("data/processed/zip_metrics_summary.csv")
+OUTPUT_HTML = "nyc_311_spatial_map.html"
+
 
 def fetch_raw_data():
     """
-    In-memory API extraction: Retrieves live 311 request logs from NYC Open Data (Socrata REST API)
-    and dumps raw records to CSV for SQL processing.
+    Extract closed 311 requests for a fixed date window from the NYC Open Data
+    (Socrata) API, paginating with a stable sort, and save them to CSV.
     """
     print("[1/4] Fetching raw 311 Service Requests from NYC Open Data API...")
-    socrata_api_url = (
-        "https://data.cityofnewyork.us/resource/erm2-nwe9.json?"
-        "$select=incident_zip,complaint_type,created_date,closed_date&"
-        "$where=created_date >= '2024-01-01T00:00:00' AND incident_zip IS NOT NULL&"
-        "$limit=15000"
+
+    headers = {}
+    token = os.environ.get("SOCRATA_APP_TOKEN")  # optional, avoids throttling
+    if token:
+        headers["X-App-Token"] = token
+
+    where = (
+        f"created_date >= '{START_DATE}' AND created_date < '{END_DATE}' "
+        "AND incident_zip IS NOT NULL AND closed_date IS NOT NULL"
     )
 
-    response = requests.get(socrata_api_url)
-    response.raise_for_status()
-    df_raw = pd.DataFrame(response.json())
+    frames, offset = [], 0
+    while offset < MAX_ROWS:
+        params = {
+            "$select": "incident_zip,complaint_type,created_date,closed_date",
+            "$where": where,
+            "$order": ":id",  # stable ordering so pages don't overlap
+            "$limit": PAGE_SIZE,
+            "$offset": offset,
+        }
+        response = requests.get(SOCRATA_URL, params=params, headers=headers, timeout=60)
+        response.raise_for_status()
+        batch = response.json()
+        if not batch:
+            break
+        frames.append(pd.DataFrame(batch))
+        offset += PAGE_SIZE
+        if len(batch) < PAGE_SIZE:
+            break
 
-    os.makedirs("data/raw", exist_ok=True)
-    raw_path = "data/raw/311_raw_sample.csv"
-    df_raw.to_csv(raw_path, index=False)
-    print(f"      Saved raw data to {raw_path}")
+    if not frames:
+        raise RuntimeError("API returned no rows for the requested window.")
+
+    df_raw = pd.concat(frames, ignore_index=True)
+    RAW_PATH.parent.mkdir(parents=True, exist_ok=True)
+    df_raw.to_csv(RAW_PATH, index=False)
+    print(f"      Saved {len(df_raw):,} rows to {RAW_PATH}")
 
 
 def process_with_sql():
     """
-    SQL Analytics Processing: Uses DuckDB to query the raw CSV file using CTEs,
-    timestamp conversions, aggregation functions, and HAVING filters.
+    Use DuckDB to aggregate resolution times per ZIP code (CTEs, timestamp math,
+    aggregates, HAVING filter).
     """
     print("[2/4] Running SQL transformations & aggregation in DuckDB...")
 
-    con = duckdb.connect()
-
-    sql_query = """
+    sql_query = f"""
     WITH parsed_data AS (
-        SELECT 
-            LPAD(CAST(incident_zip AS VARCHAR), 5, '0') AS ZIPCODE,
+        SELECT
+            LEFT(incident_zip, 5) AS ZIPCODE,
             complaint_type,
-            CAST(created_date AS TIMESTAMP) AS created_ts,
-            CAST(closed_date AS TIMESTAMP) AS closed_ts
-        FROM 'data/raw/311_raw_sample.csv'
-        WHERE incident_zip IS NOT NULL 
+            TRY_CAST(created_date AS TIMESTAMP) AS created_ts,
+            TRY_CAST(closed_date AS TIMESTAMP) AS closed_ts
+        FROM read_csv('{RAW_PATH.as_posix()}', header = true, all_varchar = true)
+        WHERE regexp_matches(incident_zip, '^[0-9]{{5}}')
           AND closed_date IS NOT NULL
     ),
     duration_calculated AS (
-        SELECT 
+        SELECT
             ZIPCODE,
             complaint_type,
             EPOCH(closed_ts - created_ts) / 3600.0 AS resolution_hours
         FROM parsed_data
-        WHERE closed_ts >= created_ts
+        WHERE created_ts IS NOT NULL
+          AND closed_ts IS NOT NULL
+          AND closed_ts >= created_ts
     )
-    SELECT 
+    SELECT
         ZIPCODE,
-        COUNT(complaint_type) AS total_requests,
+        COUNT(*) AS total_requests,
         ROUND(AVG(resolution_hours), 1) AS avg_resolution_hours,
         ROUND(MEDIAN(resolution_hours), 1) AS median_resolution_hours
     FROM duration_calculated
     GROUP BY ZIPCODE
-    HAVING COUNT(complaint_type) >= 10
+    HAVING COUNT(*) >= 10
     ORDER BY total_requests DESC;
     """
 
-    df_metrics = con.execute(sql_query).df()
-    con.close()
+    con = duckdb.connect()
+    try:
+        df_metrics = con.execute(sql_query).df()
+    finally:
+        con.close()
 
-    os.makedirs("data/processed", exist_ok=True)
-    summary_path = "data/processed/zip_metrics_summary.csv"
-    df_metrics.to_csv(summary_path, index=False)
-    print(f"      Saved SQL query output to {summary_path}")
+    if df_metrics.empty:
+        raise RuntimeError("SQL aggregation returned no ZIP codes (try a larger window).")
 
+    SUMMARY_PATH.parent.mkdir(parents=True, exist_ok=True)
+    df_metrics.to_csv(SUMMARY_PATH, index=False)
+    print(f"      Saved SQL query output to {SUMMARY_PATH} ({len(df_metrics)} ZIP codes)")
     return df_metrics
 
 
 def fetch_geojson_boundaries():
     """
-    Geospatial Processing: Loads NYC ZIP code polygon features into a GeoDataFrame
-    and standardizes CRS to EPSG:4326 (latitude/longitude).
+    Load NYC ZIP polygons into a GeoDataFrame, standardize to EPSG:4326,
+    and dissolve duplicate ZIP features into one geometry per ZIP.
     """
     print("[3/4] Loading NYC ZIP Code GeoJSON polygon boundaries...")
-    geojson_url = "https://raw.githubusercontent.com/fedeforrest/nyc-zip-code-tabulation-areas-polygons/master/zip_code_040114.geojson"
 
-    gdf_zip = gpd.read_file(geojson_url)
+    gdf_zip = gpd.read_file(GEOJSON_URL)
     gdf_zip["ZIPCODE"] = gdf_zip["postalCode"].astype(str).str.zfill(5)
 
-    if gdf_zip.crs != "EPSG:4326":
+    if gdf_zip.crs is None:
+        gdf_zip = gdf_zip.set_crs(epsg=4326)  # GeoJSON default per spec
+    elif gdf_zip.crs.to_epsg() != 4326:
         gdf_zip = gdf_zip.to_crs(epsg=4326)
 
+    gdf_zip = gdf_zip[["ZIPCODE", "geometry"]].dissolve(by="ZIPCODE").reset_index()
+    gdf_zip["geometry"] = gdf_zip.geometry.simplify(0.0005, preserve_topology=True)
     return gdf_zip
 
 
-def generate_choropleth_map(gdf_zip, df_metrics):
+def generate_choropleth_map(gdf_zip, df_metrics, show=False):
     """
-    Visual Analytics: Performs spatial join between GeoPandas shapes and SQL metrics,
-    and builds an interactive Plotly Mapbox choropleth.
+    Attribute-join SQL metrics onto ZIP polygons (on ZIPCODE) and build an
+    interactive Plotly choropleth.
     """
-    print("[4/4] Joining SQL metrics with spatial polygons & building Mapbox visual...")
+    print("[4/4] Joining SQL metrics with ZIP polygons & building map...")
 
     gdf_merged = gdf_zip.merge(df_metrics, on="ZIPCODE", how="inner")
-    geojson_dict = json.loads(gdf_merged.to_json())
+    if gdf_merged.empty:
+        raise RuntimeError("No ZIP codes matched between metrics and polygons.")
 
-    fig = px.choropleth_mapbox(
-        gdf_merged,
+    geojson_dict = json.loads(gdf_merged[["ZIPCODE", "geometry"]].to_json())
+    df_plot = pd.DataFrame(gdf_merged.drop(columns="geometry"))
+
+    fig = px.choropleth_map(
+        df_plot,
         geojson=geojson_dict,
         locations="ZIPCODE",
         featureidkey="properties.ZIPCODE",
         color="avg_resolution_hours",
         color_continuous_scale="Viridis",
-        range_color=(0, gdf_merged["avg_resolution_hours"].quantile(0.95)),
-        mapbox_style="carto-positron",
+        range_color=(0, df_plot["avg_resolution_hours"].quantile(0.95)),
+        map_style="carto-positron",
         zoom=9.5,
         center={"lat": 40.7128, "lon": -74.0060},
         opacity=0.65,
         labels={
             "avg_resolution_hours": "Avg Resolution (Hrs)",
             "median_resolution_hours": "Median Resolution (Hrs)",
-            "total_requests": "Total 311 Tickets",
+            "total_requests": "Closed 311 Tickets",
             "ZIPCODE": "ZIP Code",
         },
         hover_data={
@@ -131,29 +185,38 @@ def generate_choropleth_map(gdf_zip, df_metrics):
             "avg_resolution_hours": True,
             "median_resolution_hours": True,
         },
-        title="<b>NYC 311 Service Response Times by ZIP Code (SQL Aggregated)</b>",
+        title=(
+            "<b>NYC 311 Resolution Times by ZIP Code</b><br>"
+            "<sup>Closed requests created Jan 2024; color scale capped at 95th percentile</sup>"
+        ),
     )
 
     fig.update_layout(
-        margin={"r": 0, "t": 40, "l": 0, "b": 0},
+        margin={"r": 0, "t": 60, "l": 0, "b": 0},
         font=dict(family="Arial, sans-serif", size=12),
         title_font_size=16,
     )
 
-    output_html = "nyc_311_spatial_map.html"
-    fig.write_html(output_html)
-    print(f"\nPipeline successfully completed! Exported HTML report to {output_html}")
-    fig.show()
+    fig.write_html(OUTPUT_HTML)
+    print(f"\nPipeline completed! Exported HTML report to {OUTPUT_HTML}")
+    if show:
+        fig.show()
 
 
 def main():
+    parser = argparse.ArgumentParser(description="NYC 311 spatial response analytics")
+    parser.add_argument("--show", action="store_true", help="open the map in a browser")
+    args = parser.parse_args()
+
     try:
         fetch_raw_data()
         df_metrics = process_with_sql()
         gdf_zip = fetch_geojson_boundaries()
-        generate_choropleth_map(gdf_zip, df_metrics)
-    except Exception as e:
-        print(f"\nPipeline execution failed: {e}")
+        generate_choropleth_map(gdf_zip, df_metrics, show=args.show)
+    except Exception:
+        print("\nPipeline execution failed:", file=sys.stderr)
+        traceback.print_exc()
+        sys.exit(1)
 
 
 if __name__ == "__main__":

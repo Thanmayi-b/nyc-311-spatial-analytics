@@ -13,15 +13,14 @@ import requests
 
 SOCRATA_URL = "https://data.cityofnewyork.us/resource/erm2-nwe9.json"
 GEOJSON_URL = (
-    "https://raw.githubusercontent.com/fedeforrest/"
-    "nyc-zip-code-tabulation-areas-polygons/master/zip_code_040114.geojson"
+    "https://raw.githubusercontent.com/nycehs/NYC_geography/master/MODZCTA_2010_WGS1984.geo.json"
 )
 
 # Fixed date window so the sample is reproducible and not biased toward arbitrary rows.
 START_DATE = "2024-01-01T00:00:00"
 END_DATE = "2024-02-01T00:00:00"
-PAGE_SIZE = 50_000
-MAX_ROWS = 200_000
+PAGE_SIZE = 5_000
+MAX_ROWS = 100_000
 
 RAW_PATH = Path("data/raw/311_raw_sample.csv")
 SUMMARY_PATH = Path("data/processed/zip_metrics_summary.csv")
@@ -54,7 +53,7 @@ def fetch_raw_data():
             "$limit": PAGE_SIZE,
             "$offset": offset,
         }
-        response = requests.get(SOCRATA_URL, params=params, headers=headers, timeout=60)
+        response = requests.get(SOCRATA_URL, params=params, headers=headers, timeout=180)
         response.raise_for_status()
         batch = response.json()
         if not batch:
@@ -134,8 +133,22 @@ def fetch_geojson_boundaries():
     """
     print("[3/4] Loading NYC ZIP Code GeoJSON polygon boundaries...")
 
-    gdf_zip = gpd.read_file(GEOJSON_URL)
-    gdf_zip["ZIPCODE"] = gdf_zip["postalCode"].astype(str).str.zfill(5)
+    geo_path = Path("data/zip_boundaries.geojson")
+    if not geo_path.exists():
+        response = requests.get(GEOJSON_URL, timeout=120)
+        response.raise_for_status()
+        geo_path.parent.mkdir(parents=True, exist_ok=True)
+        geo_path.write_bytes(response.content)
+    gdf_zip = gpd.read_file(geo_path)
+
+    zip_col = next(
+        (c for c in gdf_zip.columns if c.lower() in ("modzcta", "zipcode", "postalcode", "zcta5ce10", "zcta")),
+        None,
+    )
+    if zip_col is None:
+        raise RuntimeError(f"No ZIP column found. Columns are: {list(gdf_zip.columns)}")
+    
+    gdf_zip["ZIPCODE"] = gdf_zip[zip_col].astype(str).str.zfill(5)
 
     if gdf_zip.crs is None:
         gdf_zip = gdf_zip.set_crs(epsg=4326)  # GeoJSON default per spec
@@ -161,7 +174,7 @@ def generate_choropleth_map(gdf_zip, df_metrics, show=False):
     geojson_dict = json.loads(gdf_merged[["ZIPCODE", "geometry"]].to_json())
     df_plot = pd.DataFrame(gdf_merged.drop(columns="geometry"))
 
-    fig = px.choropleth_map(
+    fig = px.choropleth(
         df_plot,
         geojson=geojson_dict,
         locations="ZIPCODE",
@@ -169,10 +182,6 @@ def generate_choropleth_map(gdf_zip, df_metrics, show=False):
         color="avg_resolution_hours",
         color_continuous_scale="Viridis",
         range_color=(0, df_plot["avg_resolution_hours"].quantile(0.95)),
-        map_style="carto-positron",
-        zoom=9.5,
-        center={"lat": 40.7128, "lon": -74.0060},
-        opacity=0.65,
         labels={
             "avg_resolution_hours": "Avg Resolution (Hrs)",
             "median_resolution_hours": "Median Resolution (Hrs)",
@@ -190,6 +199,8 @@ def generate_choropleth_map(gdf_zip, df_metrics, show=False):
             "<sup>Closed requests created Jan 2024; color scale capped at 95th percentile</sup>"
         ),
     )
+    fig.update_geos(fitbounds="locations", visible=False)
+    fig.update_traces(marker_line_width=0.5, marker_line_color="white")
 
     fig.update_layout(
         margin={"r": 0, "t": 60, "l": 0, "b": 0},
@@ -209,7 +220,11 @@ def main():
     args = parser.parse_args()
 
     try:
-        fetch_raw_data()
+        if RAW_PATH.exists():
+            print(f"[1/4] Using existing {RAW_PATH} (delete it to refetch)")
+        else:
+            fetch_raw_data()
+
         df_metrics = process_with_sql()
         gdf_zip = fetch_geojson_boundaries()
         generate_choropleth_map(gdf_zip, df_metrics, show=args.show)

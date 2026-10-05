@@ -1,0 +1,22 @@
+# Python / Virtual Environments
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+.venv/
+env/
+.env
+
+# Exclude downloaded data, keep folder structure
+data/raw/*
+data/processed/*
+!data/raw/.gitkeep
+!data/processed/.gitkeep
+
+# Operating system & IDE files
+.DS_Store
+.vscode/
+.idea/
+
+# Rendered HTML exports
+*.html
